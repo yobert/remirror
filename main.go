@@ -85,7 +85,13 @@ func (mirror Mirror) String() string {
 }
 
 var (
-	http_client = http.Client{}
+	// Compression causes issues with concurrent downloads because of
+	// Content-Length getting lost. Disable for now.
+	http_client = http.Client{
+		Transport: &http.Transport{
+			DisableCompression: true,
+		},
+	}
 
 	downloads_mu sync.Mutex
 	downloads    = map[string]*Download{}
@@ -165,6 +171,17 @@ func (mirror Mirror) CreateHandler(config *Config, fileserver http.Handler) (htt
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		log.Println(r.Method + " http://" + r.Host + r.RequestURI)
 
+		// Reject paths that escape the mirror prefix once cleaned. Without
+		// this, a request like "/archlinux/../foo" would be proxied to the
+		// upstream as "/foo", letting a remote client reach arbitrary
+		// upstream paths.
+		cleanedPath := path.Clean(r.URL.Path)
+		prefixClean := path.Clean(mirror.Prefix)
+		if cleanedPath != prefixClean && !strings.HasPrefix(cleanedPath, prefixClean+"/") {
+			http.Error(w, "Forbidden", 403)
+			return
+		}
+
 		err := func() error {
 
 			for _, upstream := range upstreams {
@@ -183,7 +200,9 @@ func (mirror Mirror) CreateHandler(config *Config, fileserver http.Handler) (htt
 					remote_url += path.Clean(upstream.Path + "/" + strings.TrimPrefix(r.URL.Path, mirror.Prefix))
 				}
 
-				if mirror.should_cache(remote_url) {
+				// Only GET is cacheable; HEAD/POST/etc. are proxied through
+				// without touching the cache.
+				if r.Method == "GET" && mirror.should_cache(remote_url) {
 					local_path = config.Data + path.Clean(r.URL.Path)
 
 					_, err := os.Stat(local_path)
@@ -197,6 +216,19 @@ func (mirror Mirror) CreateHandler(config *Config, fileserver http.Handler) (htt
 				var ok bool
 
 				downloads_mu.Lock()
+
+				// Re-stat under the lock: a concurrent goroutine may have
+				// finished its download and renamed the file into place
+				// since our pre-lock os.Stat. The rename happens inside
+				// downloads_mu (see the success path below), so taking
+				// the lock and re-stating closes that window.
+				if local_path != "" {
+					if _, err := os.Stat(local_path); err == nil {
+						downloads_mu.Unlock()
+						fileserver.ServeHTTP(w, r)
+						return nil
+					}
+				}
 
 				if r.Header.Get("Range") == "" && local_path != "" {
 					download, ok = downloads[local_path]
@@ -219,11 +251,12 @@ func (mirror Mirror) CreateHandler(config *Config, fileserver http.Handler) (htt
 
 				log.Println("-->", remote_url)
 
-				req, err := http.NewRequest("GET", remote_url, nil)
+				req, err := http.NewRequest(r.Method, remote_url, r.Body)
 				if err != nil {
 					downloads_mu.Unlock()
 					return err
 				}
+				req.ContentLength = r.ContentLength
 
 				for k, vs := range r.Header {
 					if !hopHeaders[k] {
@@ -245,6 +278,19 @@ func (mirror Mirror) CreateHandler(config *Config, fileserver http.Handler) (htt
 					resp.StatusCode == 500 ||
 					resp.StatusCode == 503 {
 					downloads_mu.Unlock()
+					resp.Body.Close()
+					continue
+				}
+
+				// Skip upstreams that send a GET 200 without a Content-Length:
+				// we can't distinguish a complete body from a truncated one,
+				// and any well-configured upstream sends Content-Length for
+				// static files. (Other status codes like 204/304 legitimately
+				// have no body, and HEAD has no body to verify.)
+				if r.Method == "GET" && resp.StatusCode == 200 && resp.ContentLength == -1 {
+					downloads_mu.Unlock()
+					resp.Body.Close()
+					log.Printf("Upstream %s returned 200 with no Content-Length; trying next mirror", remote_url)
 					continue
 				}
 
@@ -326,6 +372,14 @@ func (mirror Mirror) CreateHandler(config *Config, fileserver http.Handler) (htt
 				}
 
 				if tmp_path != "" {
+					// Don't cache zero-byte responses — a 200 with no body
+					// is almost always a misconfigured upstream, and we'd
+					// rather refetch next time than pin an empty file.
+					if n == 0 {
+						log.Printf("Empty 200 response from %s; not caching", remote_url)
+						return nil
+					}
+
 					os.MkdirAll(path.Dir(local_path), 0755)
 
 					err = tmp_needs_final_close.Close()
@@ -334,19 +388,25 @@ func (mirror Mirror) CreateHandler(config *Config, fileserver http.Handler) (htt
 						return nil
 					}
 
-					// clear from struct before renaming
 					if download != nil {
 						close(download.tmp_done)
 						downloads_mu.Lock()
+						renameErr := os.Rename(tmp_path, local_path)
 						delete(downloads, local_path)
 						downloads_mu.Unlock()
 						download = nil // so we don't re-close
-					}
 
-					err = os.Rename(tmp_path, local_path)
-					if err != nil {
-						log.Println(err)
-						return nil
+						if renameErr != nil {
+							log.Println(renameErr)
+							return nil
+						}
+					} else {
+						// shouldn't happen since tmp_path implies a download, but oh well
+						err = os.Rename(tmp_path, local_path)
+						if err != nil {
+							log.Println(err)
+							return nil
+						}
 					}
 					log.Println(">:)")
 				}
@@ -463,7 +523,7 @@ func tmp_download(local_path string, w http.ResponseWriter, download *Download, 
 		written += n
 
 		if err != nil && err != io.EOF {
-			log.Printf("Error while reading concurrent download %#s from %#s: %v\n",
+			log.Printf("Error while reading concurrent download %#v from %#v: %v\n",
 				local_path, download.tmp_path, err)
 			// Not an HTTP error: just return, and the client will hopefully
 			// handle a short read correctly.
@@ -487,7 +547,7 @@ func tmp_download(local_path string, w http.ResponseWriter, download *Download, 
 		case <-time.After(time.Second):
 			// 60 second timeout for the other goroutine to at least write _something_
 			if time.Since(last) > time.Minute {
-				log.Println("Timeout while reading concurrent download %#s from %#s\n",
+				log.Printf("Timeout while reading concurrent download %#v from %#v\n",
 					local_path,
 					download.tmp_path)
 				// Not an HTTP error: just return, and the client will hopefully

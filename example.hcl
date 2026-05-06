@@ -4,7 +4,10 @@ data = "/var/remirror"
 mirrors {
 	mirror {
 		prefix = "/archlinux/"
-		upstream = "https://mirrors.xmission.com"
+		upstreams = [
+			"https://ziply.mm.fcix.net",
+			"https://mirrors.xmission.com",
+		]
 	}
 
 	mirror {
